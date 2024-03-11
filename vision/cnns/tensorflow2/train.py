@@ -39,6 +39,7 @@ from optimizers.optimizer_factory import OptimizerFactory
 from program_steps import calculate_program_steps
 from schedules.scheduler_factory import get_lr_scheduler
 
+from energy_measure_ipu import GetIPUPower
 
 if __name__ == "__main__":
     # configure logger
@@ -420,18 +421,26 @@ if __name__ == "__main__":
                 # reset the model and optimiser weights
                 model.set_weights(init_model_params)
                 optimizer.set_weights(init_optimiser_params)
+                
+            with GetIPUPower() as energy_scope:
+                # start timer
+                time_to_train_timer.start()
 
-            # start timer
-            time_to_train_timer.start()
-
-            # Train the model
-            logging.info("Starting training")
-            model.fit(
-                train_app_dataset.pipeline,
-                steps_per_epoch=micro_batches_per_epoch // popdist.getNumInstances(),
-                epochs=hparams.num_epochs,
-                callbacks=callbacks,
-            )
+                # Train the model
+                logging.info("Starting training")
+                model.fit(
+                    train_app_dataset.pipeline,
+                    steps_per_epoch=micro_batches_per_epoch // popdist.getNumInstances(),
+                    epochs=hparams.num_epochs,
+                    callbacks=callbacks,
+                )
+           
+            logging.info('-'*64)
+            energy_scope.df.to_csv('energy-ipu.csv')
+            print("Energy-per-GPU-list:")
+            energy_int = energy_scope.energy()
+            print(f"integrated: {energy_int}")
+            logging.info('-'*64)
 
     # run validation
     if hparams.validation:
