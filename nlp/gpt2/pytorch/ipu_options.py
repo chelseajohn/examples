@@ -48,6 +48,7 @@ def get_options(config):
 
     # PopTorch options
     if config.use_popdist:
+        popdist.init()
         # Use popdist.poptorch options if running in distributed mode
         opts = popdist.poptorch.Options(ipus_per_replica=config.ipus_per_replica)
     else:
@@ -63,7 +64,7 @@ def get_options(config):
     # Enable automatic loss scaling
     # Note that it expects accumulationAndReplicationReductionType to be set
     # to Mean as above, and for accumulation by the optimizer to be done in
-    # half precision using accum_type=torch.float16 during optimizer instatiation.
+    # half precision using accum_type=torch.float16 during optimizer instantiation.
     if config.auto_loss_scaling is True:
         opts.Training.setAutomaticLossScaling(True)
 
