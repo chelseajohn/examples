@@ -28,8 +28,6 @@ class GetIPUPower(object):
     
     def _power_loop(self,queue, event, interval):
         import gcipuinfo
-        
-
         ipu_info = gcipuinfo.gcipuinfo()
         num_devices = len(ipu_info.getDevices())
         
