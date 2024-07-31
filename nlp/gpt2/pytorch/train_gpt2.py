@@ -281,8 +281,9 @@ if __name__ == "__main__":
                 )
                 if (batch_idx + 1) % args.log_steps == 0:
                     logger(
-                        "step {} of epoch {}, loss: {}, acc: {}, lr: {}, throughput: {} samples/sec".format(
-                            batch_idx, epoch, outputs_sync[0], outputs_sync[1], scheduler.get_last_lr()[0], step_throughput
+                        "step {} of epoch {}, loss: {}, acc: {}, lr: {}, throughput: {} samples/sec, step_time: {}".format(
+                            batch_idx, epoch, outputs_sync[0], outputs_sync[1], scheduler.get_last_lr()[0], step_throughput,
+                            step_length
                         )
                     )
 
