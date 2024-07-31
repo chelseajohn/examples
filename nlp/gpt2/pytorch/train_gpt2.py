@@ -49,6 +49,8 @@ from tools import (
     sync_metrics,
 )
 
+from energy_measure_ipu import GetIPUPower
+
 MODEL_CONFIG = {
     "gpt2-test": "config/config_test.json",
     "gpt2": "config/config.json",
@@ -158,150 +160,175 @@ class GPT2Wrapper(nn.Module):
 
 
 if __name__ == "__main__":
-    args = set_args()
-    opts = get_options(args)
+        
+    with GetIPUPower() as energy_scope:
+        args = set_args()
+        opts = get_options(args)
+        logger("Model initializing")
+        model_config = GPT2Config.from_json_file(os.path.join(file_dir, MODEL_CONFIG[args.model]))
+        model_config.n_positions = args.max_len
+        model = GPT2Wrapper(args, model_config).half().train()
 
-    logger("Model initializing")
-    model_config = GPT2Config.from_json_file(os.path.join(file_dir, MODEL_CONFIG[args.model]))
-    model_config.n_positions = args.max_len
-    model = GPT2Wrapper(args, model_config).half().train()
-
-    logger("Arguments: {}".format(args))
-    logger("Model config: {}".format(model_config))
-    optimizer = get_optimizer(
-        args.optimizer, args.weight_decay, args.learning_rate, args.loss_scaling, model, use_popdist=args.use_popdist
-    )
-    poptorch_model = poptorch.trainingModel(model, opts, optimizer=optimizer)
-
-    if args.compile_only:
-        # Compile model
-        logger("---------- Compilation/Loading from Cache Started ---------")
-        start_compile = time.perf_counter()
-        datum = get_generated_datum(args, model_config.vocab_size)
-        poptorch_model.compile(*datum)
-        duration_compilation = time.perf_counter() - start_compile
-        logger(f"Compiled/Loaded model in {duration_compilation} secs")
-        logger("-----------------------------------------------------------")
-        logger("Model successfully compiled. Exiting now as '--compile-only' argument was passed.")
-        sys.exit(0)
-
-    # W&B
-    if args.use_wandb and (not args.use_popdist or args.popdist_rank == 0):
-        wandb.init(
-            project="torch-gpt2",
-            settings=wandb.Settings(console="wrap"),
-            name="{}_{}_sl{}_gbs{}".format(
-                args.model,
-                model_config.vocab_size,
-                args.max_len,
-                args.batch_size * args.gradient_accumulation * args.replication_factor,
-            ),
+        logger("Arguments: {}".format(args))
+        logger("Model config: {}".format(model_config))
+        optimizer = get_optimizer(
+            args.optimizer, args.weight_decay, args.learning_rate, args.loss_scaling, model, use_popdist=args.use_popdist
         )
-        wandb_config = vars(args)
-        wandb.config.update(wandb_config)
+        poptorch_model = poptorch.trainingModel(model, opts, optimizer=optimizer)
 
-    # Dataloader
-    logger("------------------- Data Loading Started ------------------")
-    start_loading = time.perf_counter()
-    train_dataset, validate_dataset = load_dataset(logger, args, model_config.vocab_size)
-    loader = DataLoader(
-        opts,
-        train_dataset,
-        shuffle=(args.dataset == "pickle"),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        worker_init_fn=_WorkerInit(args.seed),
-        collate_fn=collate_fn if not (args.dataset == "mmap") else None,
-        drop_last=True,
-        auto_distributed_partitioning=not isinstance(train_dataset, torch.utils.data.IterableDataset),
-        mode=DataLoaderMode.AsyncRebatched if args.async_dataloader else DataLoaderMode.Sync,
-    )
-    samples_per_epoch = int(len(train_dataset) / args.epochs) if (args.dataset == "mmap") else len(train_dataset)
-    steps_per_epoch = int(len(loader) / args.epochs) if (args.dataset == "mmap") else len(loader)
-    logger(f"Samples per epoch: {samples_per_epoch}")
-    logger(f"Steps per epoch: {steps_per_epoch}")
-    if steps_per_epoch < 1:
-        raise RuntimeError(
-            "Not enough data in input_files for current configuration, "
-            "try reducing deviceIterations or gradientAccumulation."
-        )
-    duration_loader = time.perf_counter() - start_loading
-    logger(f"Data loaded in {duration_loader} secs")
-    logger("-----------------------------------------------------------")
+        if args.compile_only:
+            # Compile model
+            logger("---------- Compilation/Loading from Cache Started ---------")
+            start_compile = time.perf_counter()
+            datum = get_generated_datum(args, model_config.vocab_size)
+            poptorch_model.compile(*datum)
+            duration_compilation = time.perf_counter() - start_compile
+            logger(f"Compiled/Loaded model in {duration_compilation} secs")
+            logger("-----------------------------------------------------------")
+            logger("Model successfully compiled. Exiting now as '--compile-only' argument was passed.")
+            sys.exit(0)
 
-    if args.lr_decay_steps:
-        lr_decay_steps = args.lr_decay_steps
-    else:
-        lr_decay_steps = steps_per_epoch * args.epochs
-    if args.lr_warmup_steps:
-        lr_warmup_steps = args.lr_warmup_steps
-    else:
-        lr_warmup_steps = int(args.lr_warmup * lr_decay_steps)
-
-    scheduler = get_lr_scheduler(optimizer, args.lr_schedule, lr_warmup_steps, lr_decay_steps)
-    if args.resume_training_from_checkpoint:
-        training_state = torch.load(Path(args.checkpoint_input_dir) / "training_state.pt")
-        optimizer.load_state_dict(training_state["optimizer"])
-        scheduler.load_state_dict(training_state["lr_scheduler"])
-
-    # Training loop
-    logger("--------------------- Training Started --------------------")
-    factor = args.gradient_accumulation * args.device_iterations
-    start_train = time.perf_counter()
-
-    epoch = 0
-    total_step = 0
-    while epoch < args.epochs and total_step < steps_per_epoch * args.epochs:
-        for batch_idx, batch in enumerate(loader):
-            if args.dataset == "mmap":
-                input_ids = batch[:, :-1]
-                labels = batch[:, 1:]
-            else:
-                _input_ids, _labels = batch
-                input_ids = _input_ids[:, :-1]
-                labels = _labels[:, 1:]
-
-            start_step = time.perf_counter()
-            outputs = poptorch_model(input_ids=input_ids, labels=labels)
-            scheduler.step()
-            poptorch_model.setOptimizer(optimizer)
-            step_length = sync_metrics(time.perf_counter() - start_step)
-            outputs_sync = sync_metrics(outputs, factor)
-            num_instances = args.popdist_size if args.use_popdist else 1
-            step_throughput = (
-                num_instances
-                * args.replication_factor
-                * args.batch_size
-                * args.gradient_accumulation
-                * args.device_iterations
-                / step_length
+        # W&B
+        if args.use_wandb and (not args.use_popdist or args.popdist_rank == 0):
+            wandb.init(
+                project="torch-gpt2",
+                settings=wandb.Settings(console="wrap"),
+                name="{}_{}_sl{}_gbs{}".format(
+                    args.model,
+                    model_config.vocab_size,
+                    args.max_len,
+                    args.batch_size * args.gradient_accumulation * args.replication_factor,
+                ),
             )
-            if (batch_idx + 1) % args.log_steps == 0:
-                logger(
-                    "step {} of epoch {}, loss: {}, acc: {}, lr: {}, throughput: {} samples/sec".format(
-                        batch_idx, epoch, outputs_sync[0], outputs_sync[1], scheduler.get_last_lr()[0], step_throughput
+            wandb_config = vars(args)
+            wandb.config.update(wandb_config)
+
+        # Dataloader
+        logger("------------------- Data Loading Started ------------------")
+        start_loading = time.perf_counter()
+        train_dataset, validate_dataset = load_dataset(logger, args, model_config.vocab_size)
+        loader = DataLoader(
+            opts,
+            train_dataset,
+            shuffle=(args.dataset == "pickle"),
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            worker_init_fn=_WorkerInit(args.seed),
+            collate_fn=collate_fn if not (args.dataset == "mmap") else None,
+            drop_last=True,
+            auto_distributed_partitioning=not isinstance(train_dataset, torch.utils.data.IterableDataset),
+            mode=DataLoaderMode.AsyncRebatched if args.async_dataloader else DataLoaderMode.Sync,
+        )
+        samples_per_epoch = int(len(train_dataset) / args.epochs) if (args.dataset == "mmap") else len(train_dataset)
+        steps_per_epoch = int(len(loader) / args.epochs) if (args.dataset == "mmap") else len(loader)
+        logger(f"Samples per epoch: {samples_per_epoch}")
+        logger(f"Steps per epoch: {steps_per_epoch}")
+        if steps_per_epoch < 1:
+            raise RuntimeError(
+                "Not enough data in input_files for current configuration, "
+                "try reducing deviceIterations or gradientAccumulation."
+            )
+        duration_loader = time.perf_counter() - start_loading
+        logger(f"Data loaded in {duration_loader} secs")
+        logger("-----------------------------------------------------------")
+
+        if args.lr_decay_steps:
+            lr_decay_steps = args.lr_decay_steps
+        else:
+            lr_decay_steps = steps_per_epoch * args.epochs
+        if args.lr_warmup_steps:
+            lr_warmup_steps = args.lr_warmup_steps
+        else:
+            lr_warmup_steps = int(args.lr_warmup * lr_decay_steps)
+
+        scheduler = get_lr_scheduler(optimizer, args.lr_schedule, lr_warmup_steps, lr_decay_steps)
+        if args.resume_training_from_checkpoint:
+            training_state = torch.load(Path(args.checkpoint_input_dir) / "training_state.pt")
+            optimizer.load_state_dict(training_state["optimizer"])
+            scheduler.load_state_dict(training_state["lr_scheduler"])
+
+        # Training loop
+        logger("--------------------- Training Started --------------------")
+        factor = args.gradient_accumulation * args.device_iterations
+        start_train = time.perf_counter()
+
+        epoch = 0
+        total_step = 0
+        while epoch < args.epochs and total_step < steps_per_epoch * args.epochs:
+            for batch_idx, batch in enumerate(loader):
+                if args.dataset == "mmap":
+                    input_ids = batch[:, :-1]
+                    labels = batch[:, 1:]
+                else:
+                    _input_ids, _labels = batch
+                    input_ids = _input_ids[:, :-1]
+                    labels = _labels[:, 1:]
+
+                start_step = time.perf_counter()
+                outputs = poptorch_model(input_ids=input_ids, labels=labels)
+                scheduler.step()
+                poptorch_model.setOptimizer(optimizer)
+                step_length = sync_metrics(time.perf_counter() - start_step)
+                outputs_sync = sync_metrics(outputs, factor)
+                num_instances = args.popdist_size if args.use_popdist else 1
+                step_throughput = (
+                    num_instances
+                    * args.replication_factor
+                    * args.batch_size
+                    * args.gradient_accumulation
+                    * args.device_iterations
+                    / step_length
+                )
+                if (batch_idx + 1) % args.log_steps == 0:
+                    logger(
+                        "step {} of epoch {}, loss: {}, acc: {}, lr: {}, throughput: {} samples/sec".format(
+                            batch_idx, epoch, outputs_sync[0], outputs_sync[1], scheduler.get_last_lr()[0], step_throughput
+                        )
                     )
-                )
 
-            if args.use_wandb and (not args.use_popdist or args.popdist_rank == 0):
-                wandb.log(
-                    {
-                        "Loss": outputs_sync[0],
-                        "Acc": outputs_sync[1],
-                        "LR": scheduler.get_last_lr()[0],
-                        "Step": total_step,
-                        "Epoch": epoch + 1,
-                        "Throughput": step_throughput,
-                    }
-                )
+                if args.use_wandb and (not args.use_popdist or args.popdist_rank == 0):
+                    wandb.log(
+                        {
+                            "Loss": outputs_sync[0],
+                            "Acc": outputs_sync[1],
+                            "LR": scheduler.get_last_lr()[0],
+                            "Step": total_step,
+                            "Epoch": epoch + 1,
+                            "Throughput": step_throughput,
+                        }
+                    )
 
+                if args.checkpoint_output_dir:
+                    if not args.use_popdist or args.popdist_rank == 0:
+                        if args.save_per_steps is not None and (total_step % args.save_per_steps == 0):
+                            model_path = os.path.join(args.checkpoint_output_dir, "step_{}".format(total_step))
+                            logger("saving current model to {}".format(model_path))
+                            os.makedirs(model_path, exist_ok=True)
+                            model.model.save_pretrained(model_path)
+                            torch.save(
+                                {
+                                    "step": total_step,
+                                    "epoch": epoch,
+                                    "optimizer": optimizer.state_dict(),
+                                    "lr_scheduler": scheduler.state_dict(),
+                                    "loss": outputs_sync[0],
+                                    "acc": outputs_sync[1],
+                                    "config": args,
+                                },
+                                os.path.join(model_path, "training_state.pt"),
+                            )
+                total_step += 1
+                if total_step % steps_per_epoch == 0:
+                    epoch += 1
             if args.checkpoint_output_dir:
                 if not args.use_popdist or args.popdist_rank == 0:
-                    if args.save_per_steps is not None and (total_step % args.save_per_steps == 0):
-                        model_path = os.path.join(args.checkpoint_output_dir, "step_{}".format(total_step))
+                    if (epoch % args.save_per_epochs) == 0:
+                        model_path = os.path.join(args.checkpoint_output_dir, "epoch_{}".format(epoch + 1))
                         logger("saving current model to {}".format(model_path))
                         os.makedirs(model_path, exist_ok=True)
+
                         model.model.save_pretrained(model_path)
+
                         torch.save(
                             {
                                 "step": total_step,
@@ -314,27 +341,11 @@ if __name__ == "__main__":
                             },
                             os.path.join(model_path, "training_state.pt"),
                         )
-            total_step += 1
-            if total_step % steps_per_epoch == 0:
-                epoch += 1
-        if args.checkpoint_output_dir:
-            if not args.use_popdist or args.popdist_rank == 0:
-                if (epoch % args.save_per_epochs) == 0:
-                    model_path = os.path.join(args.checkpoint_output_dir, "epoch_{}".format(epoch + 1))
-                    logger("saving current model to {}".format(model_path))
-                    os.makedirs(model_path, exist_ok=True)
+    
 
-                    model.model.save_pretrained(model_path)
-
-                    torch.save(
-                        {
-                            "step": total_step,
-                            "epoch": epoch,
-                            "optimizer": optimizer.state_dict(),
-                            "lr_scheduler": scheduler.state_dict(),
-                            "loss": outputs_sync[0],
-                            "acc": outputs_sync[1],
-                            "config": args,
-                        },
-                        os.path.join(model_path, "training_state.pt"),
-                    )
+    
+    logging.info('-'*64)
+    energy_scope.df.to_csv(f'energy-ipu_sl{args.max_len}_gbs{args.batch_size * args.gradient_accumulation * args.replication_factor}.csv')
+    energy_int = energy_scope.energy()
+    logging.info(f"Energy-per-GPU-list integrated: {energy_int}")
+    logging.info('-'*64)
