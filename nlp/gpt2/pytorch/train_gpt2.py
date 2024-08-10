@@ -349,6 +349,6 @@ if __name__ == "__main__":
     energy_scope.df.to_csv(f'energy-ipu_sl{args.max_len}_gbs{args.batch_size * args.gradient_accumulation * args.replication_factor}.csv')
     energy_int = energy_scope.energy()
     energy_avg = np.mean(np.array(energy_int))
-    logging.info(f"Energy-per-GPU-list integrated: {energy_int}")
-    logging.info(f"Average-Energy-per-GPU: {energy_avg}")
+    logging.info(f"Energy-per-GPU-list integrated(Wh): {energy_int}")
+    logging.info(f"Average-Energy-per-GPU(Wh): {energy_avg}")
     logging.info('-'*64)
