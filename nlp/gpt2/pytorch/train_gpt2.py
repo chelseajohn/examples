@@ -12,6 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import unicodedata
+import re
+def slugify(value, allow_unicode=False):
+    """
+    Taken from https://github.com/django/django/blob/master/django/utils/text.py
+    Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
+    dashes to single dashes. Remove characters that aren't alphanumerics,
+    underscores, or hyphens. Convert to lowercase. Also strip leading and
+    trailing whitespace, dashes, and underscores.
+    """
+    value = str(value)
+    if allow_unicode:
+        value = unicodedata.normalize('NFKC', value)
+    else:
+        value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+    value = re.sub(r'[^\w\s-]', '', value.lower())
+    return re.sub(r'[-\s]+', '-', value).strip('-_')
+
 import os
 import sys
 import time
@@ -160,8 +178,11 @@ class GPT2Wrapper(nn.Module):
 
 
 if __name__ == "__main__":
+
+    from jpwr.ctxmgr import get_power
+    from jpwr.ipu.gc import power
         
-    with GetIPUPower() as energy_scope:
+    with get_power([power()],100) as energy_scope:
         args = set_args()
         opts = get_options(args)
         logger("Model initializing")
@@ -343,12 +364,30 @@ if __name__ == "__main__":
                             os.path.join(model_path, "training_state.pt"),
                         )
     
-
-    
     logging.info('-'*64)
-    energy_scope.df.to_csv(f'energy-ipu_sl{args.max_len}_gbs{args.batch_size * args.gradient_accumulation * args.replication_factor}.csv')
-    energy_int = energy_scope.energy()
-    energy_avg = np.mean(np.array(energy_int))
-    logging.info(f"Energy-per-GPU-list integrated(Wh): {energy_int}")
-    logging.info(f"Average-Energy-per-GPU(Wh): {energy_avg}")
+
+    energy_df, additional_data = energy_scope.energy()
+    import platform
+    nodename  = platform.node()
+    rankid    = int(os.getenv("SLURM_PROCID"))
+    ranks     = int(os.getenv("SLURM_NTASKS"))
+    power_file_base = os.getenv("ENERGY_PATH")
+    power_file = power_file_base.replace("csv", f"{rankid}.csv")
+    energy_scope.df["nodename"] = nodename
+    energy_scope.df["rank"] = rankid
+    if not os.path.exists(power_file):
+        energy_scope.df.to_csv(power_file)
+    energy_df["nodename"] = nodename
+    energy_df["rank"] = rankid
+    energy_file = power_file.replace("csv", f"energy.csv")
+    if not os.path.exists(energy_file):
+        energy_df.to_csv(energy_file)
+    print(f"Host: {nodename}")
+    print(f"Energy-per-GPU-list integrated(Wh): \n{energy_df.to_string()}")
+    for k,v in additional_data.items():
+        additional_path = power_file.replace("csv", f"{slugify(k)}.csv")
+        print(f"Writing {k} df to {additional_path}")
+        v.T.to_csv(additional_path)
+        print(f"Energy-per-GPU-list from {k}(Wh): {v.to_string()}")
+
     logging.info('-'*64)
