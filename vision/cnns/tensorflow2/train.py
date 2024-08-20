@@ -42,7 +42,9 @@ from schedules.scheduler_factory import get_lr_scheduler
 from energy_measure_ipu import GetIPUPower
 
 if __name__ == "__main__":
-    with GetIPUPower() as energy_scope:
+    from jpwr.ctxmgr import get_power
+    from jpwr.ipu.gc import power
+    with get_power([power()],100) as energy_scope:
         # configure logger
         logging.basicConfig(level=logging.INFO)
 
@@ -507,9 +509,28 @@ if __name__ == "__main__":
 
 
     logging.info('-'*64)
-    energy_scope.df.to_csv(f'energy-ipu_replicas{hparams.num_replicas}_gbs{hparams.global_batch_size}.csv')
-    energy_int = energy_scope.energy()
-    energy_avg = np.mean(np.array(energy_int))
-    logging.info(f"Energy-per-GPU-list integrated(Wh): {energy_int}")
-    logging.info(f"Average-Energy-per-GPU(Wh): {energy_avg}")
+
+    energy_df, additional_data = energy_scope.energy()
+    import platform
+    nodename  = platform.node()
+    rankid    = int(os.getenv("SLURM_PROCID"))
+    ranks     = int(os.getenv("SLURM_NTASKS"))
+    power_file_base = "GC200_power.csv"
+    power_file = power_file_base.replace("csv", f"{rankid}.csv")
+    energy_scope.df["nodename"] = nodename
+    energy_scope.df["rank"] = rankid
+    if not os.path.exists(power_file):
+        energy_scope.df.to_csv(power_file)
+    energy_df["nodename"] = nodename
+    energy_df["rank"] = rankid
+    energy_file = power_file.replace("csv", f"energy.csv")
+    if not os.path.exists(energy_file):
+        energy_df.to_csv(energy_file)
+    print(f"Host: {nodename}")
+    print(f"Energy-per-GPU-list integrated(Wh): \n{energy_df.to_string()}")
+    for k,v in additional_data.items():
+        additional_path = power_file.replace("csv", f"{slugify(k)}.csv")
+        print(f"Writing {k} df to {additional_path}")
+        v.T.to_csv(additional_path)
+        print(f"Energy-per-GPU-list from {k}(Wh): {v.to_string()}")
     logging.info('-'*64)
