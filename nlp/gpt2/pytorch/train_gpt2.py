@@ -369,8 +369,7 @@ if __name__ == "__main__":
     energy_df, additional_data = energy_scope.energy()
     import platform
     nodename  = platform.node()
-    rankid    = int(os.getenv("SLURM_PROCID"))
-    ranks     = int(os.getenv("SLURM_NTASKS"))
+    rankid    = int(os.getenv("MPI_LOCALRANKID"))
     power_file_base = os.getenv("ENERGY_PATH")
     power_file = power_file_base.replace("csv", f"{rankid}.csv")
     energy_scope.df["nodename"] = nodename
