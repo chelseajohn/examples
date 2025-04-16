@@ -25,6 +25,9 @@ import datasets
 import datasets.augmentations as augmentations
 from datetime import datetime
 
+from jpwr.ctxmgr import get_power
+from jpwr.ipu.gc import power
+import platform
 
 def train(training_model, training_data, args, lr_scheduler, epochs, optimizer, validation_function=None):
     training_start_time = datetime.now()
@@ -498,63 +501,89 @@ def fine_tune(args):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    opts = create_training_opts(args)
-    train_data = datasets.get_data(args, opts, train=True, async_dataloader=True)
+    with get_power([power()],100) as energy_scope:
+        opts = create_training_opts(args)
+        train_data = datasets.get_data(args, opts, train=True, async_dataloader=True)
 
-    model = models.get_model(
-        args,
-        datasets.datasets_info[args.data],
-        pretrained=False,
-        use_mixup=args.mixup_enabled,
-        use_cutmix=args.cutmix_enabled,
-        with_loss=True,
-        inference_mode=False,
-    )
-    if args.use_popdist:
-        hvd.broadcast_parameters(models.get_model_state_dict(model), root_rank=0)
-
-    optimizer = get_optimizer(args, model)
-    lr_scheduler = get_lr_scheduler(args, optimizer, len(train_data))
-    training_model = convert_to_ipu_model(model, args, optimizer)
-
-    if args.validation_mode == "during":
-        training_validation_func = get_validation_function(args, model).func
-    else:
-        training_validation_func = None
-
-    train(training_model, train_data, args, lr_scheduler, range(1, args.epoch + 1), optimizer, training_validation_func)
-    train_data.terminate()
-
-    if args.weight_avg_strategy != "none" and (not args.use_popdist or args.popdist_rank == 0):
-        average_fn = weight_avg.create_average_fn(args)
-        weight_avg.average_model_weights(
-            args.checkpoint_input_dir, args.checkpoint_output_dir, average_fn, args.weight_avg_N
+        model = models.get_model(
+            args,
+            datasets.datasets_info[args.data],
+            pretrained=False,
+            use_mixup=args.mixup_enabled,
+            use_cutmix=args.cutmix_enabled,
+            with_loss=True,
+            inference_mode=False,
         )
+        if args.use_popdist:
+            hvd.broadcast_parameters(models.get_model_state_dict(model), root_rank=0)
 
-    if args.half_res_training:
-        training_model.destroy()
-        model, training_model = fine_tune(args)
+        optimizer = get_optimizer(args, model)
+        lr_scheduler = get_lr_scheduler(args, optimizer, len(train_data))
+        training_model = convert_to_ipu_model(model, args, optimizer)
 
-    if args.validation_mode == "after":
-        training_model.destroy()
-        if args.checkpoint_input_dir == "":
-            validation_function = get_validation_function(args, model)
-            val_accuracy = validation_function.func()
-            if not args.use_popdist or args.popdist_rank == 0:
-                log_data = {
-                    "validation_epoch": args.epoch + args.fine_tune_epoch,
-                    "validation_iteration": (args.epoch + args.fine_tune_epoch)
-                    * validation_function.validation_iterations_per_epoch,
-                    "validation_accuracy": val_accuracy,
-                }
-                utils.Logger.log_validate_results(log_data)
+        if args.validation_mode == "during":
+            training_validation_func = get_validation_function(args, model).func
         else:
-            checkpoint_files = [
-                os.path.join(args.checkpoint_input_dir, file_name)
-                for file_name in os.listdir(args.checkpoint_input_dir)
-                if file_name.endswith(".pt")
-            ]
-            if args.use_popdist:
-                popdist.execute_on_instances({0}, validate_checkpoints, checkpoint_files)
+            training_validation_func = None
+
+        train(training_model, train_data, args, lr_scheduler, range(1, args.epoch + 1), optimizer, training_validation_func)
+        train_data.terminate()
+
+        if args.weight_avg_strategy != "none" and (not args.use_popdist or args.popdist_rank == 0):
+            average_fn = weight_avg.create_average_fn(args)
+            weight_avg.average_model_weights(
+                args.checkpoint_input_dir, args.checkpoint_output_dir, average_fn, args.weight_avg_N
+            )
+
+        if args.half_res_training:
+            training_model.destroy()
+            model, training_model = fine_tune(args)
+
+        if args.validation_mode == "after":
+            training_model.destroy()
+            if args.checkpoint_input_dir == "":
+                validation_function = get_validation_function(args, model)
+                val_accuracy = validation_function.func()
+                if not args.use_popdist or args.popdist_rank == 0:
+                    log_data = {
+                        "validation_epoch": args.epoch + args.fine_tune_epoch,
+                        "validation_iteration": (args.epoch + args.fine_tune_epoch)
+                        * validation_function.validation_iterations_per_epoch,
+                        "validation_accuracy": val_accuracy,
+                    }
+                    utils.Logger.log_validate_results(log_data)
             else:
-                validate_checkpoints(checkpoint_files)
+                checkpoint_files = [
+                    os.path.join(args.checkpoint_input_dir, file_name)
+                    for file_name in os.listdir(args.checkpoint_input_dir)
+                    if file_name.endswith(".pt")
+                ]
+                if args.use_popdist:
+                    popdist.execute_on_instances({0}, validate_checkpoints, checkpoint_files)
+                else:
+                    validate_checkpoints(checkpoint_files)
+
+    logging.info('-'*64)
+
+    energy_df, additional_data = energy_scope.energy()
+    nodename  = platform.node()
+    rankid    = int(os.getenv("MPI_LOCALRANKID"))
+    power_file_base = "GC200_power.csv"
+    power_file = power_file_base.replace("csv", f"{rankid}.csv")
+    energy_scope.df["nodename"] = nodename
+    energy_scope.df["rank"] = rankid
+    if not os.path.exists(power_file):
+        energy_scope.df.to_csv(power_file)
+    energy_df["nodename"] = nodename
+    energy_df["rank"] = rankid
+    energy_file = power_file.replace("csv", f"energy.csv")
+    if not os.path.exists(energy_file):
+        energy_df.to_csv(energy_file)
+    print(f"Host: {nodename}")
+    print(f"Energy-per-GPU-list integrated(Wh): \n{energy_df.to_string()}")
+    for k,v in additional_data.items():
+        additional_path = power_file.replace("csv", f"{slugify(k)}.csv")
+        print(f"Writing {k} df to {additional_path}")
+        v.T.to_csv(additional_path)
+        print(f"Energy-per-GPU-list from {k}(Wh): {v.to_string()}")
+    logging.info('-'*64)

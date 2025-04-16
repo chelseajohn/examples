@@ -35,12 +35,12 @@ resnet50: &resnet50
 
 resnet50-pod4:
   replicas: 1
-  micro_batch_size: 4
+  micro_batch_size: 16
   model: resnet50
   data: generated
+  precision: "16.16" 
   pipeline_splits: []
   device_iterations: 1
-  precision: "16.16"  
   available_memory_proportion: [0.16]  
   gradient_accumulation: 16
   lr: 0.1
